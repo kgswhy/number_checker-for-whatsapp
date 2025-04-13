@@ -1,0 +1,15 @@
+{
+    "build": {
+      "env": {
+        "NODE_ENV": "production"
+      },
+      "cmd": "npm install"
+    },
+    "deploy": {
+      "cmd": "node src/server.js",
+      "env": {
+        "PORT": "3000"
+      }
+    }
+  }
+  
