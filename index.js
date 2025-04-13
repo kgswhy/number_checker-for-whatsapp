@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import {
   makeWASocket,
@@ -9,25 +8,26 @@ import {
   makeCacheableSignalKeyStore
 } from "@whiskeysockets/baileys";
 import pino from 'pino';
-import cors from 'cors';
+import chalk from 'chalk';
 import { Boom } from "@hapi/boom";
-import path from 'path';
-import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const port = process.env.PORT || 3000;
+const port = 3000;
 
 // Middleware
-app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// WhatsApp connection setup
+// WhatsApp connection variables
 const store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) });
 let sock = null;
 let whatsappStatus = "disconnected";
 
+// Helper function for colored console output
+const color = (text, color) => {
+  return !color ? chalk.green(text) : chalk.keyword(color)(text);
+};
+
+// Connect to WhatsApp
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("baileys_auth_info");
   const { version } = await fetchLatestBaileysVersion();
@@ -39,84 +39,121 @@ async function connectToWhatsApp() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, pino()),
     },
-    browser: Browsers.macOS("Chrome")
+    browser: Browsers.macOS("Chrome"),
+    generateHighQualityLinkPreview: true,
   });
 
   store?.bind(sock.ev);
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    
-    if (qr) {
-      console.log("QR Code generated");
-      whatsappStatus = "qr_ready";
-    }
+    const { connection, lastDisconnect } = update;
+    console.log("Connection Update:", update);
 
     if (connection === "open") {
       whatsappStatus = "connected";
-      console.log("✓ WhatsApp Connected!");
+      console.log(color("✓ Connected to WhatsApp!", "green"));
     }
 
     if (connection === "close") {
       whatsappStatus = "disconnected";
       const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
-      console.log(`Connection lost (reason: ${reason}), reconnecting...`);
-      setTimeout(connectToWhatsApp, 5000);
+      console.log(color(`✗ Disconnected, reason: ${reason}`, "red"));
+      
+      setTimeout(() => {
+        console.log("Attempting to reconnect...");
+        connectToWhatsApp();
+      }, 5000);
     }
   });
 
   sock.ev.on("creds.update", saveCreds);
 }
 
-// API Routes
-app.get('/api/status', (req, res) => {
-  res.json({ status: whatsappStatus });
+// Initialize WhatsApp connection
+connectToWhatsApp();
+
+// API Endpoints
+app.get('/status', (req, res) => {
+  res.json({ 
+    status: whatsappStatus,
+    is_connected: whatsappStatus === "connected",
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.post('/api/check-numbers', async (req, res) => {
-  if (whatsappStatus !== "connected") {
-    return res.status(503).json({ error: "WhatsApp not connected" });
-  }
-
+app.post('/check-number', async (req, res) => {
   try {
-    const { numbers } = req.body;
-    const results = { active: [], inactive: [] };
-
-    for (const number of numbers) {
-      const cleanNumber = number.toString().replace(/\D/g, '');
-      if (!cleanNumber) continue;
-
-      try {
-        const [result] = await sock.onWhatsApp(`${cleanNumber}@s.whatsapp.net`);
-        if (result?.exists) {
-          results.active.push({
-            number: cleanNumber,
-            jid: result.jid,
-            isBusiness: result.isBusiness
-          });
-        } else {
-          results.inactive.push(cleanNumber);
-        }
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`Error checking ${cleanNumber}:`, error);
-        results.inactive.push(cleanNumber);
-      }
+    let attempts = 0;
+    while (whatsappStatus !== "connected" && attempts < 15) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+      console.log(`Waiting for WhatsApp connection... (${attempts}/15)`);
     }
 
-    res.json(results);
+    if (whatsappStatus !== "connected") {
+      return res.status(503).json({ 
+        success: false, 
+        message: "WhatsApp connection not ready",
+        status: whatsappStatus
+      });
+    }
+
+    // Expecting only a single number here, not an array
+    const { number } = req.body;
+
+    if (!number) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Please provide a valid number in the request body" 
+      });
+    }
+
+    console.log(`Checking number: ${number}`);
+
+    const cleanNumber = number.toString().replace(/[^0-9]/g, "");
+
+    if (!cleanNumber) {
+      console.log(color(`Skipping invalid number: ${number}`, "yellow"));
+      return res.status(400).json({
+        success: false,
+        message: "Invalid phone number format"
+      });
+    }
+
+    const [result] = await sock.onWhatsApp(`${cleanNumber}@s.whatsapp.net`);
+
+    if (result?.exists) {
+      console.log(color(`✓ ${cleanNumber} is active (jid: ${result.jid})`, "green"));
+      return res.json({
+        success: true,
+        number: cleanNumber,
+        status: 'active',
+        jid: result.jid,
+        isBusiness: result.isBusiness,
+        connection_status: whatsappStatus
+      });
+    } else {
+      console.log(color(`✗ ${cleanNumber} is inactive`, "red"));
+      return res.json({
+        success: true,
+        number: cleanNumber,
+        status: 'inactive',
+        connection_status: whatsappStatus
+      });
+    }
+
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("Error in /check-number:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error",
+      error: error.message 
+    });
   }
 });
 
-// Serve frontend
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
 
-// Start server
-connectToWhatsApp();
 app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+  console.log(`WhatsApp Number Checker API running on http://localhost:${port}`);
+  console.log("Waiting for WhatsApp connection...");
 });
